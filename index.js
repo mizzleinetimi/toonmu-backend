@@ -1,91 +1,139 @@
-// Load environment variables from .env file for local development
-require('dotenv').config();
-const express = require('express');
-const cors = require('cors');
+        require('dotenv').config();
+        const express = require('express');
+        const cors = require('cors');
+        const { createClient } = require('@supabase/supabase-js');
 
-const app = express();
-// Use a larger limit for the request body to handle base64 image data
-app.use(express.json({ limit: '10mb' }));
-app.use(cors());
+        // --- Initialization ---
+        const app = express();
+        app.use(express.json({ limit: '10mb' }));
+        app.use(cors());
 
-const PORT = process.env.PORT || 3000;
-const OPENAI_API_URL = "https://api.openai.com/v1/responses";
+        const PORT = process.env.PORT || 3000;
+        const OPENAI_API_URL = "https://api.openai.com/v1/responses";
+        const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
-// Health check endpoint to verify the server is running
-app.get('/', (req, res) => {
-  res.send('Toonmu Backend is running!');
-});
 
-// The main endpoint for generating toons
-app.post('/generate-toon', async (req, res) => {
-  console.log("Received request for /generate-toon");
+        // --- Background Processing Function ---
+        const processGeneration = async (creationId, imageDataUrl, stylePrompt, userId) => {
+          try {
+            // 1. Construct the request to OpenAI
+            const userText = `Restyle this image in the following art style: ${stylePrompt}. Keep composition, subjects, and details.`;
+            const body = {
+              model: "gpt-4o-mini",
+              input: [{ role: "user", content: [{ type: "input_text", text: userText }, { type: "input_image", image_url: imageDataUrl }] }],
+              tools: [{ type: "image_generation" }],
+              input_fidelity: "high" // Use high fidelity for better results
+            };
 
-  // 1. Validate and parse the incoming request body
-  const { imageDataUrl, stylePrompt } = req.body;
-  if (!imageDataUrl || !stylePrompt) {
-    console.error("Validation Error: Missing imageDataUrl or stylePrompt");
-    return res.status(400).json({ error: "Missing imageDataUrl or stylePrompt" });
-  }
+            // 2. Call the OpenAI API
+            console.log(`[${creationId}] Forwarding request to OpenAI...`);
+            const openAIResponse = await fetch(OPENAI_API_URL, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.OPENAI_API_KEY}` },
+              body: JSON.stringify(body)
+            });
+            
+            const responseData = await openAIResponse.json();
 
-  // 2. Retrieve the OpenAI API key securely
-  const openAIKey = process.env.OPENAI_API_KEY;
-  if (!openAIKey) {
-    console.error("Server Configuration Error: Missing OPENAI_API_KEY");
-    return res.status(500).json({ error: "Server configuration error." });
-  }
+            if (!openAIResponse.ok) {
+              throw new Error(responseData.error?.message || "OpenAI API request failed");
+            }
 
-  // 3. Construct the request to OpenAI
-  const userText = `Restyle this image in the following art style: ${stylePrompt}. Keep composition, subjects, and details.`;
-  const body = {
-    model: "gpt-4o-mini",
-    input: [
-      {
-        role: "user",
-        content: [
-          { type: "input_text", text: userText },
-          { type: "input_image", image_url: imageDataUrl }
-        ]
-      }
-    ],
-    tools: [{ type: "image_generation" }]
-  };
+            // 3. Extract the generated image data
+            const imageBase64 = responseData.output?.find((o) => o.type === 'image_generation_call')?.result;
+            if (!imageBase64) {
+              throw new Error("Could not find generated image in OpenAI response.");
+            }
 
-  try {
-    // 4. Call the OpenAI API
-    console.log("Forwarding request to OpenAI API...");
-    const openAIResponse = await fetch(OPENAI_API_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${openAIKey}`
-      },
-      body: JSON.stringify(body)
-    });
+            // 4. Upload the result to Supabase Storage
+            console.log(`[${creationId}] Uploading result to Supabase Storage...`);
+            const imageBuffer = Buffer.from(imageBase64, 'base64');
+            const filePath = `${userId}/${creationId}.png`;
+            
+            // NOTE: Make sure you have a storage bucket named "creations" in your Supabase project
+            const { data: uploadData, error: uploadError } = await supabase.storage
+              .from('creations')
+              .upload(filePath, imageBuffer, { contentType: 'image/png', upsert: true });
+              
+            if (uploadError) throw uploadError;
 
-    const responseData = await openAIResponse.json();
+            // 5. Get public URL and update the record as "completed"
+            const { data: { publicUrl } } = supabase.storage.from('creations').getPublicUrl(filePath);
+            
+            console.log(`[${creationId}] Generation successful. Updating status.`);
+            await supabase
+              .from('toon_creations')
+              .update({ status: 'completed', image_url: publicUrl })
+              .eq('id', creationId);
 
-    if (!openAIResponse.ok) {
-      console.error('OpenAI API error:', responseData);
-      return res.status(openAIResponse.status).json({ error: responseData.error?.message || "OpenAI API request failed" });
-    }
+          } catch (error) {
+            console.error(`[${creationId}] Generation failed:`, error);
+            await supabase
+              .from('toon_creations')
+              .update({ status: 'failed', error_message: error.message })
+              .eq('id', creationId);
+          }
+        };
 
-    // 5. Extract the generated image data
-    const imageGenerationOutput = responseData.output?.find((o) => o.type === 'image_generation_call');
-    if (!imageGenerationOutput || !imageGenerationOutput.result) {
-      console.error("Extraction Error: Could not find generated image in OpenAI response.");
-      return res.status(500).json({ error: 'Could not find generated image in OpenAI response.' });
-    }
+        // --- API Endpoints ---
 
-    // 6. Return the image data to the app
-    console.log("Successfully generated toon, sending response to app.");
-    res.status(200).json({ toonImageData: imageGenerationOutput.result });
+        app.get('/', (req, res) => {
+          res.send('Toonmu Backend is running!');
+        });
 
-  } catch (error) {
-    console.error("An unexpected error occurred:", error);
-    res.status(500).json({ error: error.message });
-  }
-});
+        // Endpoint to start a generation job
+        app.post('/generate-toon', async (req, res) => {
+          console.log("Received request for /generate-toon");
 
-app.listen(PORT, () => {
-  console.log(`Server is running on port ${PORT}`);
-}); 
+          const { imageDataUrl, stylePrompt, userId } = req.body;
+          if (!imageDataUrl || !stylePrompt || !userId) {
+            return res.status(400).json({ error: "Missing imageDataUrl, stylePrompt, or userId" });
+          }
+
+          // 1. Immediately insert a "pending" record into the database
+          const { data, error } = await supabase
+            .from('toon_creations')
+            .insert({
+              user_id: userId,
+              style_name: stylePrompt, // Using the full prompt as the style name for now
+              status: 'pending'
+            })
+            .select('id')
+            .single();
+
+          if (error) {
+            console.error("Failed to create job record:", error);
+            return res.status(500).json({ error: "Could not create generation record." });
+          }
+
+          const creationId = data.id;
+          console.log(`[${creationId}] Job created for user ${userId}.`);
+
+          // 2. Return the ID to the app immediately
+          res.status(202).json({ creationId: creationId });
+
+          // 3. Start the actual processing in the background (fire and forget)
+          processGeneration(creationId, imageDataUrl, stylePrompt, userId);
+        });
+
+        // Endpoint for the app to poll for status
+        app.get('/creation-status/:id', async (req, res) => {
+          const { id } = req.params;
+
+          const { data, error } = await supabase
+            .from('toon_creations')
+            .select('*')
+            .eq('id', id)
+            .single();
+
+          if (error || !data) {
+            return res.status(404).json({ error: "Creation not found." });
+          }
+
+          res.status(200).json(data);
+        });
+
+        // --- Start Server ---
+        app.listen(PORT, () => {
+          console.log(`Server is running on port ${PORT}`);
+        });
