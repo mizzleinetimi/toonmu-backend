@@ -143,6 +143,54 @@ app.get('/creation-status/:id', async (req, res) => {
   res.status(200).json(data);
 });
 
+// Secure account deletion (requires Supabase access token from client)
+app.delete('/account', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+    if (!token) {
+      return res.status(401).json({ error: 'Missing bearer token' });
+    }
+
+    const { data: userData, error: getUserError } = await supabase.auth.getUser(token);
+    if (getUserError || !userData?.user) {
+      return res.status(401).json({ error: 'Invalid or expired token' });
+    }
+    const userId = userData.user.id;
+
+    // 1) Delete DB rows owned by the user
+    await supabase.from('toon_creations').delete().eq('user_id', userId);
+    // Best-effort delete of profile row if present
+    await supabase.from('profiles').delete().eq('id', userId);
+
+    // 2) Delete Storage files under the user's folder
+    const { data: files, error: listErr } = await supabase.storage
+      .from('creations')
+      .list(userId, { limit: 1000 });
+    if (listErr) {
+      console.warn('Storage list error:', listErr);
+    }
+    if (files && files.length > 0) {
+      const paths = files.map(f => `${userId}/${f.name}`);
+      const { error: remErr } = await supabase.storage.from('creations').remove(paths);
+      if (remErr) {
+        console.warn('Storage remove error:', remErr);
+      }
+    }
+
+    // 3) Delete the auth user
+    const { error: delErr } = await supabase.auth.admin.deleteUser(userId);
+    if (delErr) {
+      return res.status(500).json({ error: delErr.message || 'Failed to delete user' });
+    }
+
+    return res.status(200).json({ ok: true });
+  } catch (e) {
+    console.error('Delete account failed:', e);
+    return res.status(500).json({ error: 'Failed to delete account' });
+  }
+});
+
 // --- Start Server ---
 app.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);
