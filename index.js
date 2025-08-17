@@ -63,7 +63,8 @@ const processGeneration = async (creationId, imageDataUrl, stylePrompt, userId) 
     }
 
     console.log(`[${creationId}] Uploading result to Supabase Storage...`);
-    const filePath = `${userId}/${creationId}.png`;
+    const userFolder = String(userId).toLowerCase();
+    const filePath = `${userFolder}/${creationId}.png`;
     const { error: uploadError } = await supabase.storage
       .from('creations')
       .upload(filePath, imageBuffer, { contentType: 'image/png', upsert: true });
@@ -158,25 +159,87 @@ app.delete('/account', async (req, res) => {
     }
     const userId = userData.user.id;
 
-    // 1) Delete DB rows owned by the user
-    await supabase.from('toon_creations').delete().eq('user_id', userId);
-    // Best-effort delete of profile row if present
-    await supabase.from('profiles').delete().eq('id', userId);
+    // 1) Collect storage keys from DB before we delete DB rows
+    const { data: creationRows } = await supabase
+      .from('toon_creations')
+      .select('image_url')
+      .eq('user_id', userId);
 
-    // 2) Delete Storage files under the user's folder
-    const { data: files, error: listErr } = await supabase.storage
-      .from('creations')
-      .list(userId, { limit: 1000 });
-    if (listErr) {
-      console.warn('Storage list error:', listErr);
-    }
-    if (files && files.length > 0) {
-      const paths = files.map(f => `${userId}/${f.name}`);
-      const { error: remErr } = await supabase.storage.from('creations').remove(paths);
+    const extractKey = (url) => {
+      try {
+        if (!url) return null;
+        const u = new URL(url);
+        const path = decodeURIComponent(u.pathname);
+        const markers = ['/object/public/creations/', '/storage/v1/object/public/creations/'];
+        for (const m of markers) {
+          const i = path.indexOf(m);
+          if (i >= 0) return path.substring(i + m.length);
+        }
+        // fallback: if it already looks like a key
+        if (!path.includes('/')) return path;
+        return null;
+      } catch { return null; }
+    };
+
+    const keysFromDB = (creationRows || [])
+      .map(r => extractKey(r.image_url))
+      .filter(Boolean);
+
+    if (keysFromDB.length > 0) {
+      const { data: removed, error: remErr } = await supabase.storage
+        .from('creations')
+        .remove(keysFromDB);
       if (remErr) {
-        console.warn('Storage remove error:', remErr);
+        console.warn('[DELETE /account] Storage remove (from DB keys) error:', remErr);
+      } else {
+        console.log(`[DELETE /account] Removed ${Array.isArray(removed) ? removed.length : keysFromDB.length} files by DB keys`);
       }
     }
+
+    // 2) Best-effort delete of profile row if present
+    await supabase.from('profiles').delete().eq('id', userId);
+
+    // 3) Delete Storage files under possible user folders (handle case mismatches)
+    const candidates = Array.from(new Set([
+      String(userId),
+      String(userId).toLowerCase(),
+      String(userId).toUpperCase()
+    ]));
+    let totalRemoved = 0;
+    for (const folder of candidates) {
+      const { data: files, error: listErr } = await supabase.storage
+        .from('creations')
+        .list(folder, { limit: 1000 });
+      if (listErr) {
+        console.warn(`[DELETE /account] Storage list error for ${folder}:`, listErr);
+        continue;
+      }
+      if (files && files.length > 0) {
+        const paths = files.map(f => `${folder}/${f.name}`);
+        const { data: removed, error: remErr } = await supabase.storage.from('creations').remove(paths);
+        if (remErr) {
+          console.warn(`[DELETE /account] Storage remove error for ${folder}:`, remErr);
+        } else {
+          totalRemoved += Array.isArray(removed) ? removed.length : paths.length;
+          console.log(`[DELETE /account] Removed ${Array.isArray(removed) ? removed.length : paths.length} files from ${folder}`);
+        }
+      }
+    }
+
+    // Also remove avatar files if any
+    for (const folder of candidates) {
+      const { data: files, error: listErr } = await supabase.storage
+        .from('avatars')
+        .list(folder, { limit: 1000 });
+      if (!listErr && files && files.length > 0) {
+        const paths = files.map(f => `${folder}/${f.name}`);
+        await supabase.storage.from('avatars').remove(paths);
+        console.log(`[DELETE /account] Removed ${paths.length} avatar files from ${folder}`);
+      }
+    }
+
+    // 4) Delete DB rows owned by the user (after storage to preserve keys)
+    await supabase.from('toon_creations').delete().eq('user_id', userId);
 
     // 3) Delete the auth user
     const { error: delErr } = await supabase.auth.admin.deleteUser(userId);
@@ -184,6 +247,7 @@ app.delete('/account', async (req, res) => {
       return res.status(500).json({ error: delErr.message || 'Failed to delete user' });
     }
 
+    console.log(`[DELETE /account] Deleted user ${userId}`);
     return res.status(200).json({ ok: true });
   } catch (e) {
     console.error('Delete account failed:', e);
@@ -195,4 +259,3 @@ app.delete('/account', async (req, res) => {
 app.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);
 });
-
